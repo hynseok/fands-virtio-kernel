@@ -670,6 +670,7 @@ void iommu_dma_free_iova(struct iommu_dma_cookie *cookie,
 		free_iova_fast(iovad, iova_pfn(iovad, iova),
 				size >> iova_shift(iovad));
 }
+EXPORT_SYMBOL(iommu_dma_free_iova);
 
 static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 		size_t size)
