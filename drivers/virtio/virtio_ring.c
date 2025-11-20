@@ -2648,11 +2648,12 @@ EXPORT_SYMBOL_GPL(vring_create_virtqueue);
  *
  */
 int virtqueue_resize(struct virtqueue *_vq, u32 num,
-		     void (*recycle)(struct virtqueue *vq, void *buf))
+		     void (*recycle)(struct virtqueue *vq, void *buf, void *ctx))
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	struct virtio_device *vdev = vq->vq.vdev;
 	void *buf;
+	void *ctx;
 	int err;
 
 	if (!vq->we_own_ring)
@@ -2677,8 +2678,8 @@ int virtqueue_resize(struct virtqueue *_vq, u32 num,
 	if (err)
 		return err;
 
-	while ((buf = virtqueue_detach_unused_buf(_vq)) != NULL)
-		recycle(_vq, buf);
+	while ((buf = virtqueue_detach_unused_buf_ctx(_vq, &ctx)) != NULL)
+		recycle(_vq, buf, ctx);
 
 	if (vq->packed_ring)
 		err = virtqueue_resize_packed(_vq, num);

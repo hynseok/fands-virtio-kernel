@@ -90,8 +90,6 @@ bool virtqueue_enable_cb_delayed(struct virtqueue *vq);
 
 void *virtqueue_detach_unused_buf(struct virtqueue *vq);
 
-void *virtqueue_detach_unused_buf_ctx(struct virtqueue *vq, void **ctx);
-
 unsigned int virtqueue_get_vring_size(struct virtqueue *vq);
 
 bool virtqueue_is_broken(struct virtqueue *vq);
@@ -214,4 +212,6 @@ void unregister_virtio_driver(struct virtio_driver *drv);
 #define module_virtio_driver(__virtio_driver) \
 	module_driver(__virtio_driver, register_virtio_driver, \
 			unregister_virtio_driver)
+void *virtqueue_detach_unused_buf_ctx(struct virtqueue *vq, void **ctx);
+
 #endif /* _LINUX_VIRTIO_H */
