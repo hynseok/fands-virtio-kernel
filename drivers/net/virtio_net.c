@@ -1470,8 +1470,8 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 	if (rq->batch_left == 0) {
 		struct iommu_domain *domain = iommu_get_dma_domain(vi->dev->dev.parent);
 		if (domain) {
-			dma_addr_t batch_iova = iommu_dma_alloc_iova(domain, PAGE_SIZE * 64,
-								     vi->dev->dev.parent);
+			dma_addr_t batch_iova = iommu_dma_alloc_iova(domain, PAGE_SIZE * 64, 
+										dma_get_mask(vi->dev->dev.parent), vi->dev->dev.parent);
 			if (batch_iova) {
 				batch = kzalloc(sizeof(*batch), gfp);
 				if (batch) {
