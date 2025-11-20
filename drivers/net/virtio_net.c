@@ -19,6 +19,7 @@
 #include <linux/average.h>
 #include <linux/filter.h>
 #include <linux/dma-iommu.h>
+#include <linux/dma-mapping.h>
 #include <linux/iommu.h>
 #include <linux/kernel.h>
 #include <net/route.h>
@@ -315,7 +316,7 @@ struct padded_vnet_hdr {
 	char padding[12];
 };
 
-static void virtnet_rq_free_unused_buf(struct virtqueue *vq, void *buf);
+static void virtnet_rq_free_unused_buf(struct virtqueue *vq, void *buf, void* ctx);
 static void virtnet_sq_free_unused_buf(struct virtqueue *vq, void *buf);
 
 static bool is_xdp_frame(void *ptr)
@@ -1469,8 +1470,8 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 	if (rq->batch_left == 0) {
 		struct iommu_domain *domain = iommu_get_dma_domain(vi->dev->dev.parent);
 		if (domain) {
-			dma_addr_t batch_iova = iommu_dma_alloc_iova(domain, PAGE_SIZE * 64,
-								     vi->dev->dev.parent);
+			dma_addr_t batch_iova = iommu_dma_alloc_iova(domain, PAGE_SIZE * 64, 
+																										dma_get_mask(vi->dev->dev.parent), vi->dev->dev.parent);
 			if (batch_iova) {
 				batch = kzalloc(sizeof(*batch), gfp);
 				if (batch) {
