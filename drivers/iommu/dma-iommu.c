@@ -654,7 +654,7 @@ dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
 }
 EXPORT_SYMBOL(iommu_dma_alloc_iova);
 
-static void iommu_dma_free_iova(struct iommu_dma_cookie *cookie,
+void iommu_dma_free_iova(struct iommu_dma_cookie *cookie,
 		dma_addr_t iova, size_t size, struct iommu_iotlb_gather *gather)
 {
 	struct iova_domain *iovad = &cookie->iovad;

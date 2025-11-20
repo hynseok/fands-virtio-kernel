@@ -26,7 +26,7 @@ dma_addr_t iommu_dma_map_page(struct device *dev, struct page *page,
 		unsigned long attrs);
 dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
 		size_t size, u64 dma_limit, struct device *dev);
-static void iommu_dma_free_iova(struct iommu_dma_cookie *cookie,
+void iommu_dma_free_iova(struct iommu_dma_cookie *cookie,
 		dma_addr_t iova, size_t size, struct iommu_iotlb_gather *gather);
 
 /* Domain management interface for IOMMU drivers */
