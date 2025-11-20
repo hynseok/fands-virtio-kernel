@@ -2477,12 +2477,15 @@ static int domain_add_dev_info(struct dmar_domain *domain, struct device *dev)
 		if (hw_pass_through && domain_type_is_si(domain))
 			ret = intel_pasid_setup_pass_through(iommu, domain,
 					dev, PASID_RID2PASID);
-		else if (domain_use_first_level(domain))
+		else if (domain_use_first_level(domain)) { 
 			ret = domain_setup_first_level(iommu, domain, dev,
 					PASID_RID2PASID);
+		}
 		else
+		{
 			ret = intel_pasid_setup_second_level(iommu, domain,
 					dev, PASID_RID2PASID);
+		}
 		if (ret) {
 			dev_err(dev, "Setup RID2PASID failed\n");
 			dmar_remove_one_dev_info(dev);

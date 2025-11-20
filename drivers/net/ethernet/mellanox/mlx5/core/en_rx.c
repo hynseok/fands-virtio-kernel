@@ -35,6 +35,8 @@
 #include <linux/tcp.h>
 #include <linux/bitmap.h>
 #include <linux/filter.h>
+#include <linux/dma-iommu.h>
+#include <linux/iommu.h>
 #include <net/ip6_checksum.h>
 #include <net/page_pool.h>
 #include <net/inet_ecn.h>
@@ -278,9 +280,14 @@ static inline int mlx5e_page_alloc_pool(struct mlx5e_rq *rq,
 	dma_info->page = page_pool_dev_alloc_pages(rq->page_pool);
 	if (unlikely(!dma_info->page))
 		return -ENOMEM;
-
-	dma_info->addr = dma_map_page_attrs(rq->pdev, dma_info->page, 0, PAGE_SIZE,
+	//printk("debug: page_alloc, batch_iova: %d, iova: %llu\n", dma_info->batch_iova, dma_info->iova);
+	if (dma_info->batch_iova) {
+		dma_info->addr = dma_map_page_attrs_iova(rq->pdev, dma_info->page, dma_info->iova, dma_info->first_iova, 0, PAGE_SIZE,
 					    rq->buff.map_dir, DMA_ATTR_SKIP_CPU_SYNC);
+	} else {
+		dma_info->addr = dma_map_page_attrs(rq->pdev, dma_info->page, 0, PAGE_SIZE,
+							rq->buff.map_dir, DMA_ATTR_SKIP_CPU_SYNC);
+	}
 	if (unlikely(dma_mapping_error(rq->pdev, dma_info->addr))) {
 		page_pool_recycle_direct(rq->page_pool, dma_info->page);
 		dma_info->page = NULL;
@@ -300,25 +307,35 @@ static inline int mlx5e_page_alloc(struct mlx5e_rq *rq,
 		return mlx5e_page_alloc_pool(rq, dma_info);
 }
 
-void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct page *page)
+void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct page *page, size_t iova_size, bool free_iova)
 {
 	dma_addr_t dma_addr = page_pool_get_dma_addr(page);
+	//printk("debug: page_unmap, iova_size: %lu, iova: %llu\n", iova_size, dma_addr);
 
-	dma_unmap_page_attrs(rq->pdev, dma_addr, PAGE_SIZE, rq->buff.map_dir,
+	if (iova_size) {
+		if (free_iova) {
+			dma_addr -= 63 * 4096;
+			dma_unmap_page_attrs_iova(rq->pdev, dma_addr, PAGE_SIZE * 64, iova_size, free_iova, rq->buff.map_dir,
+				     DMA_ATTR_SKIP_CPU_SYNC);
+		}
+	} else {
+		//printk("debug: not_iova_size, iova_size: %lu, iova: %llu\n", iova_size, dma_addr);
+		dma_unmap_page_attrs(rq->pdev, dma_addr, PAGE_SIZE, rq->buff.map_dir,
 			     DMA_ATTR_SKIP_CPU_SYNC);
+	}
 	page_pool_set_dma_addr(page, 0);
 }
 
-void mlx5e_page_release_dynamic(struct mlx5e_rq *rq, struct page *page, bool recycle)
+void mlx5e_page_release_dynamic(struct mlx5e_rq *rq, struct page *page, bool recycle, size_t iova_size, bool free_iova)
 {
 	if (likely(recycle)) {
 		if (mlx5e_rx_cache_put(rq, page))
 			return;
 
-		mlx5e_page_dma_unmap(rq, page);
+		mlx5e_page_dma_unmap(rq, page, iova_size, free_iova);
 		page_pool_recycle_direct(rq->page_pool, page);
 	} else {
-		mlx5e_page_dma_unmap(rq, page);
+		mlx5e_page_dma_unmap(rq, page, iova_size, free_iova);
 		page_pool_release_page(rq->page_pool, page);
 		put_page(page);
 	}
@@ -335,7 +352,7 @@ static inline void mlx5e_page_release(struct mlx5e_rq *rq,
 		 */
 		xsk_buff_free(dma_info->xsk);
 	else
-		mlx5e_page_release_dynamic(rq, dma_info->page, recycle);
+		mlx5e_page_release_dynamic(rq, dma_info->page, recycle, dma_info->iova_size, dma_info->free_iova);
 }
 
 static inline int mlx5e_get_rx_frag(struct mlx5e_rq *rq,
@@ -349,6 +366,7 @@ static inline int mlx5e_get_rx_frag(struct mlx5e_rq *rq,
 		 * offset) should just use the new one without replenishing again
 		 * by themselves.
 		 */
+		 frag->di->batch_iova = false;
 		err = mlx5e_page_alloc(rq, frag->di);
 
 	return err;
@@ -358,8 +376,10 @@ static inline void mlx5e_put_rx_frag(struct mlx5e_rq *rq,
 				     struct mlx5e_wqe_frag_info *frag,
 				     bool recycle)
 {
-	if (frag->last_in_page)
+	if (frag->last_in_page) {
+		frag->di->iova_size=0;
 		mlx5e_page_release(rq, frag->di, recycle);
+	}
 }
 
 static inline struct mlx5e_wqe_frag_info *get_frag(struct mlx5e_rq *rq, u16 ix)
@@ -487,9 +507,36 @@ mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi, bool recycle
 	no_xdp_xmit = bitmap_empty(wi->xdp_xmit_bitmap,
 				   MLX5_MPWRQ_PAGES_PER_WQE);
 
-	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++)
-		if (no_xdp_xmit || !test_bit(i, wi->xdp_xmit_bitmap))
-			mlx5e_page_release(rq, &dma_info[i], recycle);
+	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++) {
+		if (no_xdp_xmit || !test_bit(i, wi->xdp_xmit_bitmap)) { 
+			//WARN_ON(!dma_info[i].batch_iova);
+		//	if (dma_info[i].batch_iova) {
+			if (device_iommu_mapped(rq->pdev)) {
+				//printk("debug: yes_batch, iova_size: %lu, iova: %llu, addr: %llu", dma_info[i].iova_size,dma_info[i].iova,dma_info[i].addr);
+				dma_info[i].iova_size = 4096 * 64;
+				dma_info[i].batch_iova = true;
+				dma_info[i].free_iova = i == (MLX5_MPWRQ_PAGES_PER_WQE - 1); /* only want to free once at the end. It will automatically subtract to get the beginning */
+				mlx5e_page_release(rq, &dma_info[i], false);
+			} else { 
+				//printk("debug: no_batch, iova: %llu, addr: %llu, iova_size: %lu", dma_info[i].iova, dma_info[i].addr, dma_info[i].iova_size);
+				dma_info[i].iova_size = 0;
+				mlx5e_page_release(rq, &dma_info[i], recycle);
+			}
+		}
+	}
+	
+	//TODO: PUT REAL VALUE HERE FOR BATCHING BEING ON, probably just want to make it a macro to be shared in alloc and free mpwqe
+	//TODO: ALSO probably want to make the batch size a macro to be reused here
+	// if (iova_batch) {
+	// 	struct iommu_domain *domain = iommu_get_dma_domain(rq->pdev);
+	// 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+	// 	struct iommu_iotlb_gather iotlb_gather;
+
+	// 	iommu_iotlb_gather_init(&iotlb_gather);
+	// 	iotlb_gather.queued = READ_ONCE(cookie->fq_domain);
+
+	// 	iommu_dma_free_iova(cookie, dma_info->page->dma_addr, size, &iotlb_gather);
+	// }
 }
 
 static void mlx5e_post_rx_mpwqe(struct mlx5e_rq *rq, u8 n)
@@ -574,6 +621,7 @@ static int mlx5e_build_shampo_hd_umr(struct mlx5e_rq *rq,
 		header_offset = (index & (MLX5E_SHAMPO_WQ_HEADER_PER_PAGE - 1)) <<
 			MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE;
 		if (!(header_offset & (PAGE_SIZE - 1))) {
+			dma_info->batch_iova = false;
 			err = mlx5e_page_alloc(rq, dma_info);
 			if (unlikely(err))
 				goto err_unmap;
@@ -611,6 +659,7 @@ err_unmap:
 		dma_info = &shampo->info[--index];
 		if (!(i & (MLX5E_SHAMPO_WQ_HEADER_PER_PAGE - 1))) {
 			dma_info->addr = ALIGN_DOWN(dma_info->addr, PAGE_SIZE);
+			dma_info->iova_size = 0;
 			mlx5e_page_release(rq, dma_info, true);
 		}
 	}
@@ -664,9 +713,15 @@ static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
 	struct mlx5e_icosq *sq = rq->icosq;
 	struct mlx5_wq_cyc *wq = &sq->wq;
 	struct mlx5e_umr_wqe *umr_wqe;
+	unsigned long iova_allocation_size;
+	bool fands;
+	dma_addr_t iova_base;
+	dma_addr_t iova;
 	u16 pi;
 	int err;
 	int i;
+
+//	//printk("MLX5_MPWRQ_PAGES_PER_WQE: %lu",MLX5_MPWRQ_PAGES_PER_WQE);
 
 	/* Check in advance that we have enough frames, instead of allocating
 	 * one-by-one, failing and moving frames to the Reuse Ring.
@@ -687,11 +742,39 @@ static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
 	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
 	memcpy(umr_wqe, &rq->mpwqe.umr_wqe, offsetof(struct mlx5e_umr_wqe, inline_mtts));
 
+	/* Batch IOVA allocation changes */
+	iova_allocation_size = 4096 * MLX5_MPWRQ_PAGES_PER_WQE;
+	fands = device_iommu_mapped(rq->pdev);
+
+	iova_base = 0;
+	iova = 0;
+	if (fands) {
+		iova_base = iommu_dma_alloc_iova(iommu_get_dma_domain(rq->pdev), iova_allocation_size, dma_get_mask(rq->pdev), rq->pdev);
+		WARN_ON(!iova_base);
+	}
+
+	/* End of Batch IOVA allocation changes*/
+
 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+		dma_info->batch_iova = fands;
+		dma_info->iova = 0;
+		dma_info->iova_size = 0;
+		dma_info->first_iova = false;
+		if (fands) {
+			iova = iova_base + (i * 4096);
+			//printk("DEBUG: alloc page with iova %llu, cpu: %d", iova, smp_processor_id());
+			dma_info->iova = iova;
+			dma_info->iova_size = iova_allocation_size;
+			if(i==0){
+				dma_info->first_iova = true;
+			}
+		}
 		err = mlx5e_page_alloc(rq, dma_info);
 		if (unlikely(err))
 			goto err_unmap;
 		umr_wqe->inline_mtts[i].ptag = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
+		//if (smp_processor_id() == 4) 
+		//	trace_printk("core: %d, ix: %u, %llu\n", smp_processor_id(), ix, dma_info->addr);
 	}
 
 	bitmap_zero(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
@@ -718,6 +801,9 @@ static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
 err_unmap:
 	while (--i >= 0) {
 		dma_info--;
+		if (!dma_info->batch_iova) {
+			dma_info->iova_size=0;
+		}
 		mlx5e_page_release(rq, dma_info, true);
 	}
 
@@ -752,6 +838,7 @@ void mlx5e_shampo_dealloc_hd(struct mlx5e_rq *rq, u16 len, u16 start, bool close
 		hd_info->addr = ALIGN_DOWN(hd_info->addr, PAGE_SIZE);
 		if (hd_info->page != deleted_page) {
 			deleted_page = hd_info->page;
+			hd_info->iova_size=0;
 			mlx5e_page_release(rq, hd_info, false);
 		}
 	}
@@ -1850,11 +1937,11 @@ mlx5e_fill_skb_data(struct sk_buff *skb, struct mlx5e_rq *rq, struct mlx5e_dma_i
 		    u32 data_bcnt, u32 data_offset)
 {
 	net_prefetchw(skb->data);
-
+	////printk("DEBUG: NEW PACKET (%u offset)", data_offset);
 	while (data_bcnt) {
 		u32 pg_consumed_bytes = min_t(u32, PAGE_SIZE - data_offset, data_bcnt);
 		unsigned int truesize;
-
+         //       //printk("page address: %llu, Data offset: %u, full address: %llu, consumed_bytes: %u",page_to_phys(di->page),data_offset,data_offset + page_to_phys(di->page), pg_consumed_bytes);
 		if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state))
 			truesize = pg_consumed_bytes;
 		else
@@ -1867,6 +1954,7 @@ mlx5e_fill_skb_data(struct sk_buff *skb, struct mlx5e_rq *rq, struct mlx5e_dma_i
 		data_offset = 0;
 		di++;
 	}
+//	//printk("DEBUG: PACKET FINISHED");
 }
 
 static struct sk_buff *
@@ -2049,6 +2137,7 @@ mlx5e_free_rx_shampo_hd_entry(struct mlx5e_rq *rq, u16 header_index)
 
 	if (((header_index + 1) & (MLX5E_SHAMPO_WQ_HEADER_PER_PAGE - 1)) == 0) {
 		shampo->info[header_index].addr = ALIGN_DOWN(addr, PAGE_SIZE);
+		shampo->info[header_index].iova_size = 0;
 		mlx5e_page_release(rq, &shampo->info[header_index], true);
 	}
 	bitmap_clear(shampo->bitmap, header_index, 1);
@@ -2391,6 +2480,7 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+		////printk("DEBUG: Striding WQ");
 		rq->mpwqe.skb_from_cqe_mpwrq = xsk ?
 			mlx5e_xsk_skb_from_cqe_mpwrq_linear :
 			mlx5e_rx_mpwqe_is_linear_skb(mdev, params, NULL) ?
@@ -2415,6 +2505,7 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 
 		break;
 	default: /* MLX5_WQ_TYPE_CYCLIC */
+	//	//printk("DEBUG: Cyclic WQ");
 		rq->wqe.skb_from_cqe = xsk ?
 			mlx5e_xsk_skb_from_cqe_linear :
 			mlx5e_rx_is_linear_skb(params, NULL) ?
