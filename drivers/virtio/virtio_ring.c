@@ -85,6 +85,9 @@ struct vring_desc_extra {
 	u16 next;			/* The next desc state in a list. */
 };
 
+/* Flag to indicate the buffer is pre-mapped (internal use) */
+#define VRING_DESC_F_PREMAPPED (1 << 15)
+
 struct vring_virtqueue_split {
 	/* Actual memory layout for this queue. */
 	struct vring vring;
@@ -513,7 +516,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 				      unsigned int in_sgs,
 				      void *data,
 				      void *ctx,
-				      gfp_t gfp)
+				      gfp_t gfp,
+				      bool premapped)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	struct scatterlist *sg;
@@ -574,7 +578,13 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 
 	for (n = 0; n < out_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
-			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_TO_DEVICE);
+			dma_addr_t addr;
+			
+			if (premapped)
+				addr = sg_dma_address(sg);
+			else
+				addr = vring_map_one_sg(vq, sg, DMA_TO_DEVICE);
+
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
@@ -585,11 +595,19 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			i = virtqueue_add_desc_split(_vq, desc, i, addr, sg->length,
 						     VRING_DESC_F_NEXT,
 						     indirect);
+			if (premapped && !indirect)
+				vq->split.desc_extra[prev].flags |= VRING_DESC_F_PREMAPPED;
 		}
 	}
 	for (; n < (out_sgs + in_sgs); n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
-			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE);
+			dma_addr_t addr;
+			
+			if (premapped)
+				addr = sg_dma_address(sg);
+			else
+				addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE);
+			
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
@@ -602,6 +620,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 						     VRING_DESC_F_NEXT |
 						     VRING_DESC_F_WRITE,
 						     indirect);
+			if (premapped && !indirect)
+				vq->split.desc_extra[prev].flags |= VRING_DESC_F_PREMAPPED;
 		}
 	}
 	/* Last one doesn't continue. */
@@ -733,12 +753,14 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 	i = head;
 
 	while (vq->split.vring.desc[i].flags & nextflag) {
-		vring_unmap_one_split(vq, i);
+		if (!(vq->split.desc_extra[i].flags & VRING_DESC_F_PREMAPPED))
+			vring_unmap_one_split(vq, i);
 		i = vq->split.desc_extra[i].next;
 		vq->vq.num_free++;
 	}
 
-	vring_unmap_one_split(vq, i);
+	if (!(vq->split.desc_extra[i].flags & VRING_DESC_F_PREMAPPED))
+		vring_unmap_one_split(vq, i);
 	vq->split.desc_extra[i].next = vq->free_head;
 	vq->free_head = head;
 
@@ -919,7 +941,7 @@ static bool virtqueue_enable_cb_delayed_split(struct virtqueue *_vq)
 	return true;
 }
 
-static void *virtqueue_detach_unused_buf_split(struct virtqueue *_vq)
+static void *virtqueue_detach_unused_buf_split(struct virtqueue *_vq, void **ctx)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	unsigned int i;
@@ -932,7 +954,7 @@ static void *virtqueue_detach_unused_buf_split(struct virtqueue *_vq)
 			continue;
 		/* detach_buf_split clears data, so grab it now. */
 		buf = vq->split.desc_state[i].data;
-		detach_buf_split(vq, i, NULL);
+		detach_buf_split(vq, i, ctx);
 		vq->split.avail_idx_shadow--;
 		vq->split.vring.avail->idx = cpu_to_virtio16(_vq->vdev,
 				vq->split.avail_idx_shadow);
@@ -1225,7 +1247,8 @@ static int virtqueue_add_indirect_packed(struct vring_virtqueue *vq,
 					 unsigned int out_sgs,
 					 unsigned int in_sgs,
 					 void *data,
-					 gfp_t gfp)
+					 gfp_t gfp,
+					 bool premapped)
 {
 	struct vring_packed_desc *desc;
 	struct scatterlist *sg;
@@ -1251,7 +1274,10 @@ static int virtqueue_add_indirect_packed(struct vring_virtqueue *vq,
 
 	for (n = 0; n < out_sgs + in_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
-			addr = vring_map_one_sg(vq, sg, n < out_sgs ?
+			if (premapped)
+				addr = sg_dma_address(sg);
+			else
+				addr = vring_map_one_sg(vq, sg, n < out_sgs ?
 					DMA_TO_DEVICE : DMA_FROM_DEVICE);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
@@ -1340,7 +1366,8 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 				       unsigned int in_sgs,
 				       void *data,
 				       void *ctx,
-				       gfp_t gfp)
+				       gfp_t gfp,
+				       bool premapped)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	struct vring_packed_desc *desc;
@@ -1366,7 +1393,7 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 
 	if (virtqueue_use_indirect(vq, total_sg)) {
 		err = virtqueue_add_indirect_packed(vq, sgs, total_sg, out_sgs,
-						    in_sgs, data, gfp);
+						    in_sgs, data, gfp, premapped);
 		if (err != -ENOMEM) {
 			END_USE(vq);
 			return err;
@@ -1398,8 +1425,14 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 	c = 0;
 	for (n = 0; n < out_sgs + in_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
-			dma_addr_t addr = vring_map_one_sg(vq, sg, n < out_sgs ?
+			dma_addr_t addr;
+
+			if (premapped)
+				addr = sg_dma_address(sg);
+			else
+				addr = vring_map_one_sg(vq, sg, n < out_sgs ?
 					DMA_TO_DEVICE : DMA_FROM_DEVICE);
+
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
@@ -1420,6 +1453,8 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 				vq->packed.desc_extra[curr].len = sg->length;
 				vq->packed.desc_extra[curr].flags =
 					le16_to_cpu(flags);
+				if (premapped)
+					vq->packed.desc_extra[curr].flags |= VRING_DESC_F_PREMAPPED;
 			}
 			prev = curr;
 			curr = vq->packed.desc_extra[curr].next;
@@ -1552,8 +1587,9 @@ static void detach_buf_packed(struct vring_virtqueue *vq,
 	if (unlikely(vq->use_dma_api)) {
 		curr = id;
 		for (i = 0; i < state->num; i++) {
-			vring_unmap_extra_packed(vq,
-						 &vq->packed.desc_extra[curr]);
+			if (!(vq->packed.desc_extra[curr].flags & VRING_DESC_F_PREMAPPED))
+				vring_unmap_extra_packed(vq,
+							 &vq->packed.desc_extra[curr]);
 			curr = vq->packed.desc_extra[curr].next;
 		}
 	}
@@ -1790,7 +1826,7 @@ static bool virtqueue_enable_cb_delayed_packed(struct virtqueue *_vq)
 	return true;
 }
 
-static void *virtqueue_detach_unused_buf_packed(struct virtqueue *_vq)
+static void *virtqueue_detach_unused_buf_packed(struct virtqueue *_vq, void **ctx)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	unsigned int i;
@@ -1803,7 +1839,7 @@ static void *virtqueue_detach_unused_buf_packed(struct virtqueue *_vq)
 			continue;
 		/* detach_buf clears data, so grab it now. */
 		buf = vq->packed.desc_state[i].data;
-		detach_buf_packed(vq, i, NULL);
+		detach_buf_packed(vq, i, ctx);
 		END_USE(vq);
 		return buf;
 	}
@@ -2079,14 +2115,15 @@ static inline int virtqueue_add(struct virtqueue *_vq,
 				unsigned int in_sgs,
 				void *data,
 				void *ctx,
-				gfp_t gfp)
+				gfp_t gfp,
+				bool premapped)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 
 	return vq->packed_ring ? virtqueue_add_packed(_vq, sgs, total_sg,
-					out_sgs, in_sgs, data, ctx, gfp) :
+					out_sgs, in_sgs, data, ctx, gfp, premapped) :
 				 virtqueue_add_split(_vq, sgs, total_sg,
-					out_sgs, in_sgs, data, ctx, gfp);
+					out_sgs, in_sgs, data, ctx, gfp, premapped);
 }
 
 /**
@@ -2120,7 +2157,7 @@ int virtqueue_add_sgs(struct virtqueue *_vq,
 			total_sg++;
 	}
 	return virtqueue_add(_vq, sgs, total_sg, out_sgs, in_sgs,
-			     data, NULL, gfp);
+			     data, NULL, gfp, false);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_sgs);
 
@@ -2142,7 +2179,7 @@ int virtqueue_add_outbuf(struct virtqueue *vq,
 			 void *data,
 			 gfp_t gfp)
 {
-	return virtqueue_add(vq, &sg, num, 1, 0, data, NULL, gfp);
+	return virtqueue_add(vq, &sg, num, 1, 0, data, NULL, gfp, false);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_outbuf);
 
@@ -2164,7 +2201,7 @@ int virtqueue_add_inbuf(struct virtqueue *vq,
 			void *data,
 			gfp_t gfp)
 {
-	return virtqueue_add(vq, &sg, num, 0, 1, data, NULL, gfp);
+	return virtqueue_add(vq, &sg, num, 0, 1, data, NULL, gfp, false);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_inbuf);
 
@@ -2188,9 +2225,33 @@ int virtqueue_add_inbuf_ctx(struct virtqueue *vq,
 			void *ctx,
 			gfp_t gfp)
 {
-	return virtqueue_add(vq, &sg, num, 0, 1, data, ctx, gfp);
+	return virtqueue_add(vq, &sg, num, 0, 1, data, ctx, gfp, false);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_ctx);
+
+/**
+ * virtqueue_add_inbuf_premapped - expose input buffers to other end
+ * @vq: the struct virtqueue we're talking about.
+ * @sg: scatterlist (must be well-formed and terminated!)
+ * @num: the number of entries in @sg writable by other side
+ * @data: the token identifying the buffer.
+ * @ctx: extra context for the token
+ * @gfp: how to do memory allocations (if necessary).
+ *
+ * Caller must ensure we don't call this with other virtqueue operations
+ * at the same time (except where noted).
+ *
+ * Returns zero or a negative error (ie. ENOSPC, ENOMEM, EIO).
+ */
+int virtqueue_add_inbuf_premapped(struct virtqueue *vq,
+				  struct scatterlist *sg, unsigned int num,
+				  void *data,
+				  void *ctx,
+				  gfp_t gfp)
+{
+	return virtqueue_add(vq, &sg, num, 0, 1, data, ctx, gfp, true);
+}
+EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_premapped);
 
 /**
  * virtqueue_kick_prepare - first half of split virtqueue_kick call.
@@ -2405,19 +2466,32 @@ bool virtqueue_enable_cb_delayed(struct virtqueue *_vq)
 EXPORT_SYMBOL_GPL(virtqueue_enable_cb_delayed);
 
 /**
- * virtqueue_detach_unused_buf - detach first unused buffer
- * @_vq: the struct virtqueue we're talking about.
+ * virtqueue_detach_unused_buf_ctx - detach first unused buffer
+ * @_vq: the struct virtqueue
+ * @ctx: extra context for the token
  *
  * Returns NULL or the "data" token handed to virtqueue_add_*().
- * This is not valid on an active queue; it is useful for device
- * shutdown or the reset queue.
+ * This has no effect on the device.
  */
-void *virtqueue_detach_unused_buf(struct virtqueue *_vq)
+void *virtqueue_detach_unused_buf_ctx(struct virtqueue *_vq, void **ctx)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 
-	return vq->packed_ring ? virtqueue_detach_unused_buf_packed(_vq) :
-				 virtqueue_detach_unused_buf_split(_vq);
+	return vq->packed_ring ? virtqueue_detach_unused_buf_packed(_vq, ctx) :
+				 virtqueue_detach_unused_buf_split(_vq, ctx);
+}
+EXPORT_SYMBOL_GPL(virtqueue_detach_unused_buf_ctx);
+
+/**
+ * virtqueue_detach_unused_buf - detach first unused buffer
+ * @_vq: the struct virtqueue
+ *
+ * Returns NULL or the "data" token handed to virtqueue_add_*().
+ * This has no effect on the device.
+ */
+void *virtqueue_detach_unused_buf(struct virtqueue *_vq)
+{
+	return virtqueue_detach_unused_buf_ctx(_vq, NULL);
 }
 EXPORT_SYMBOL_GPL(virtqueue_detach_unused_buf);
 

@@ -18,6 +18,8 @@
 #include <linux/cpu.h>
 #include <linux/average.h>
 #include <linux/filter.h>
+#include <linux/dma-iommu.h>
+#include <linux/iommu.h>
 #include <linux/kernel.h>
 #include <net/route.h>
 #include <net/xdp.h>
@@ -140,6 +142,22 @@ struct send_queue {
 	bool reset;
 };
 
+/* F&S Batching structure */
+struct iova_batch;
+
+struct iova_ctx {
+	struct iova_batch *batch;
+};
+
+struct iova_batch {
+	dma_addr_t iova_base;
+	size_t size;
+	atomic_t ref;
+	unsigned int headroom;
+	unsigned int len;
+	struct iova_ctx ctxs[64];
+};
+
 /* Internal representation of a receive virtqueue */
 struct receive_queue {
 	/* Virtqueue associated with this receive_queue */
@@ -170,6 +188,10 @@ struct receive_queue {
 	char name[40];
 
 	struct xdp_rxq_info xdp_rxq;
+	
+	/* F&S Batching */
+	struct iova_batch *current_batch;
+	int batch_left;
 };
 
 /* This structure can contain rss message with maximum settings for indirection table and keysize
@@ -946,11 +968,30 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 	int offset = buf - page_address(page);
 	struct sk_buff *head_skb, *curr_skb;
 	struct bpf_prog *xdp_prog;
-	unsigned int truesize = mergeable_ctx_to_truesize(ctx);
-	unsigned int headroom = mergeable_ctx_to_headroom(ctx);
+	unsigned int truesize;
+	unsigned int headroom;
 	unsigned int metasize = 0;
 	unsigned int frame_sz;
 	int err;
+	struct iova_ctx *my_ctx = NULL;
+
+	if ((unsigned long)ctx > 0x100000000ULL) {
+		my_ctx = ctx;
+		ctx = mergeable_len_to_ctx(my_ctx->batch->len, my_ctx->batch->headroom);
+	}
+
+	truesize = mergeable_ctx_to_truesize(ctx);
+	headroom = mergeable_ctx_to_headroom(ctx);
+
+	if (my_ctx) {
+		struct iova_batch *batch = my_ctx->batch;
+		if (atomic_dec_and_test(&batch->ref)) {
+			struct iommu_domain *domain = iommu_get_dma_domain(vi->dev->dev.parent);
+			iommu_dma_free_iova(domain->iova_cookie, batch->iova_base,
+					    batch->size, NULL);
+			kfree(batch);
+		}
+	}
 
 	head_skb = NULL;
 	stats->bytes += len - vi->hdr_len;
@@ -1185,15 +1226,28 @@ err_xdp:
 err_skb:
 	put_page(page);
 	while (num_buf-- > 1) {
-		buf = virtqueue_get_buf(rq->vq, &len);
+		buf = virtqueue_get_buf_ctx(rq->vq, &len, &ctx);
 		if (unlikely(!buf)) {
 			pr_debug("%s: rx error: %d buffers missing\n",
 				 dev->name, num_buf);
 			dev->stats.rx_length_errors++;
-			break;
+			goto err_buf;
 		}
-		stats->bytes += len;
-		page = virt_to_head_page(buf);
+
+		if ((unsigned long)ctx > 0x100000000ULL) {
+			struct iova_ctx *my_ctx = ctx;
+			ctx = mergeable_len_to_ctx(my_ctx->batch->len, my_ctx->batch->headroom);
+			
+			if (atomic_dec_and_test(&my_ctx->batch->ref)) {
+				struct iommu_domain *domain = iommu_get_dma_domain(vi->dev->dev.parent);
+				iommu_dma_free_iova(domain->iova_cookie, my_ctx->batch->iova_base,
+						    my_ctx->batch->size, NULL);
+				kfree(my_ctx->batch);
+			}
+		}
+
+		headroom = mergeable_ctx_to_headroom(ctx);
+		truesize = mergeable_ctx_to_truesize(ctx);
 		put_page(page);
 	}
 err_buf:
@@ -1401,12 +1455,40 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 	void *ctx;
 	int err;
 	unsigned int len, hole;
+	struct iova_batch *batch = NULL;
+	dma_addr_t iova = 0;
+	bool first_iova = false;
 
 	/* Extra tailroom is needed to satisfy XDP's assumption. This
 	 * means rx frags coalescing won't work, but consider we've
 	 * disabled GSO for XDP, it won't be a big issue.
 	 */
 	len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
+
+	/* F&S Batching Logic */
+	if (rq->batch_left == 0) {
+		struct iommu_domain *domain = iommu_get_dma_domain(vi->dev->dev.parent);
+		if (domain) {
+			dma_addr_t batch_iova = iommu_dma_alloc_iova(domain, PAGE_SIZE * 64,
+								     vi->dev->dev.parent);
+			if (batch_iova) {
+				batch = kzalloc(sizeof(*batch), gfp);
+				if (batch) {
+					batch->iova_base = batch_iova;
+					batch->size = PAGE_SIZE * 64;
+					atomic_set(&batch->ref, 0);
+					batch->headroom = headroom;
+					batch->len = len;
+					rq->current_batch = batch;
+					rq->batch_left = 64;
+				} else {
+					iommu_dma_free_iova(domain->iova_cookie, batch_iova,
+							    PAGE_SIZE * 64, NULL);
+				}
+			}
+		}
+	}
+
 	if (unlikely(!skb_page_frag_refill(len + room, alloc_frag, gfp)))
 		return -ENOMEM;
 
@@ -1425,10 +1507,46 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 	}
 
 	sg_init_one(rq->sg, buf, len);
-	ctx = mergeable_len_to_ctx(len, headroom);
-	err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
-	if (err < 0)
-		put_page(virt_to_head_page(buf));
+
+	if (rq->batch_left > 0) {
+		int index = 64 - rq->batch_left;
+		batch = rq->current_batch;
+		iova = batch->iova_base + index * PAGE_SIZE;
+		first_iova = (index == 0);
+
+		iova = dma_map_page_attrs_iova(vi->dev->dev.parent, alloc_frag->page, iova,
+					       first_iova, alloc_frag->offset, len + room,
+					       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+		
+		/* Adjust IOVA to point to buffer start (after headroom) */
+		iova += headroom;
+
+		sg_dma_address(rq->sg) = iova;
+		sg_dma_len(rq->sg) = len;
+
+		batch->ctxs[index].batch = batch;
+		ctx = &batch->ctxs[index];
+
+		err = virtqueue_add_inbuf_premapped(rq->vq, rq->sg, 1, buf, ctx, gfp);
+		if (err < 0) {
+			/* If add fails, we don't increment ref.
+			 * We don't unmap immediately because the batch is still valid.
+			 * But if this was the first one and it failed, we might want to cleanup?
+			 * For simplicity, we leave it. It will be cleaned up when batch_left reaches 0?
+			 * No, batch_left is decremented only on success.
+			 * If we fail, we retry later.
+			 */
+			put_page(virt_to_head_page(buf));
+		} else {
+			atomic_inc(&batch->ref);
+			rq->batch_left--;
+		}
+	} else {
+		ctx = mergeable_len_to_ctx(len, headroom);
+		err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
+		if (err < 0)
+			put_page(virt_to_head_page(buf));
+	}
 
 	return err;
 }
@@ -3374,14 +3492,23 @@ static void virtnet_sq_free_unused_buf(struct virtqueue *vq, void *buf)
 		xdp_return_frame(ptr_to_xdp(buf));
 }
 
-static void virtnet_rq_free_unused_buf(struct virtqueue *vq, void *buf)
+static void virtnet_rq_free_unused_buf(struct virtqueue *vq, void *buf, void *ctx)
 {
 	struct virtnet_info *vi = vq->vdev->priv;
 	int i = vq2rxq(vq);
 
-	if (vi->mergeable_rx_bufs)
+	if (vi->mergeable_rx_bufs) {
+		if ((unsigned long)ctx > 0x100000000ULL) {
+			struct iova_ctx *my_ctx = ctx;
+			if (atomic_dec_and_test(&my_ctx->batch->ref)) {
+				struct iommu_domain *domain = iommu_get_dma_domain(vi->dev->dev.parent);
+				iommu_dma_free_iova(domain->iova_cookie, my_ctx->batch->iova_base,
+						    my_ctx->batch->size, NULL);
+				kfree(my_ctx->batch);
+			}
+		}
 		put_page(virt_to_head_page(buf));
-	else if (vi->big_packets)
+	} else if (vi->big_packets)
 		give_pages(&vi->rq[i], buf);
 	else
 		put_page(virt_to_head_page(buf));
@@ -3400,8 +3527,9 @@ static void free_unused_bufs(struct virtnet_info *vi)
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		struct virtqueue *vq = vi->rq[i].vq;
-		while ((buf = virtqueue_detach_unused_buf(vq)) != NULL)
-			virtnet_rq_free_unused_buf(vq, buf);
+		void *ctx;
+		while ((buf = virtqueue_detach_unused_buf_ctx(vq, &ctx)) != NULL)
+			virtnet_rq_free_unused_buf(vq, buf, ctx);
 	}
 }
 
